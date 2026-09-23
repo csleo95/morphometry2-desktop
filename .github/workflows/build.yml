@@ -28,9 +28,13 @@ jobs:
         include:
           - os: ubuntu-22.04      # oldest glibc supported; a newer build
             name: linux           # will not run on older distros
-          - os: macos-13          # Intel: the .app then runs on Apple Silicon
-            name: macos           # too, through Rosetta. An ARM runner would
-                                  # produce an Apple-Silicon-only app.
+          # macos-13 is the Intel runner, which would produce an app that also
+          # runs on Apple Silicon through Rosetta - but those runners are being
+          # retired and a job can sit queued indefinitely waiting for one.
+          # macos-14 is Apple Silicon and actually available; the app it builds
+          # is Apple-Silicon-only, which covers any Mac sold since late 2020.
+          - os: macos-14
+            name: macos
           - os: windows-latest
             name: windows
 
@@ -80,7 +84,10 @@ jobs:
   # download links. Artifacts alone need a GitHub login and expire.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # always(): publish whatever did build. Without this a single platform
+    # failing - or sitting queued waiting for a runner - blocks the release
+    # entirely, so nobody can download the builds that already succeeded.
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
