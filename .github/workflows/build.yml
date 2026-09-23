@@ -1,0 +1,113 @@
+# Builds the app for Linux, macOS and Windows, and publishes the three files
+# so ENIGMA sites can download one and run it.
+#
+# PyInstaller cannot cross-compile: each OS must build on its own runner.
+# That is why this is CI rather than a local script.
+#
+# Verified on Linux with PyInstaller 6.22.3: the plain --onefile build already
+# bundles runtime.py, because `import runtime` is a static top-level import
+# that PyInstaller's analysis resolves on its own.
+#
+#   Run workflow (Actions tab) -> artifacts, for testing
+#   Push a tag  v1.0, v1.1 ... -> a Release with public download links
+#
+# Sites download from the Releases page. They need nothing but Docker.
+
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04      # oldest glibc supported; a newer build
+            name: linux           # will not run on older distros
+          - os: macos-13          # Intel: the .app then runs on Apple Silicon
+            name: macos           # too, through Rosetta. An ARM runner would
+                                  # produce an Apple-Silicon-only app.
+          - os: windows-latest
+            name: windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade pip pyinstaller
+
+      # --windowed suppresses the console window on Windows and produces a
+      # .app bundle rather than a bare binary on macOS.
+      - name: Build
+        run: >
+          pyinstaller --onefile --windowed
+          --name ENIGMA-morphometry
+          morphometry-desktop.py
+
+      # A .app is a directory, so it has to be zipped to survive download.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "${{ matrix.name }}" = "macos" ]; then
+            test -d dist/ENIGMA-morphometry.app || { echo "no .app produced"; exit 1; }
+            ditto -c -k --sequesterRsrc --keepParent \
+                  dist/ENIGMA-morphometry.app out/ENIGMA-morphometry-macos.zip
+          elif [ "${{ matrix.name }}" = "windows" ]; then
+            test -f dist/ENIGMA-morphometry.exe || { echo "no .exe produced"; exit 1; }
+            cp dist/ENIGMA-morphometry.exe out/ENIGMA-morphometry.exe
+          else
+            test -f dist/ENIGMA-morphometry || { echo "no binary produced"; exit 1; }
+            cp dist/ENIGMA-morphometry out/ENIGMA-morphometry-linux
+          fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ENIGMA-morphometry-${{ matrix.name }}
+          path: out/*
+
+  # Turns the three builds into a Releases page with permanent, public
+  # download links. Artifacts alone need a GitHub login and expire.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Collect
+        run: |
+          mkdir -p release
+          find downloaded -type f -exec cp {} release/ \;
+          ls -la release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body: |
+            Download the file for your computer, then open it.
+
+            | Your computer | File | How to open |
+            |---|---|---|
+            | Windows | `ENIGMA-morphometry.exe` | double-click |
+            | macOS | `ENIGMA-morphometry-macos.zip` | unzip, then right-click the app and choose Open |
+            | Linux | `ENIGMA-morphometry-linux` | make it executable, then run it |
+
+            Docker must be installed and running. The app says so if it is not.
+
+            macOS shows a warning for unsigned apps the first time - right-click
+            and choose Open to get past it.

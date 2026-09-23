@@ -1,0 +1,18 @@
+# ---------------------------------------------------------------------------
+# NEVER publish subject data. This folder holds real scans and recon-all
+# output from local test runs; it must not reach a remote repository.
+# ---------------------------------------------------------------------------
+test/
+*.nii
+*.nii.gz
+
+# Build output - the binaries are produced by CI, not committed
+ENIGMA-morphometry
+ENIGMA-morphometry.exe
+build/
+dist/
+*.spec
+__pycache__/
+
+# Machine-specific: Exec= holds an absolute path for one computer
+ENIGMA-morphometry.desktop
