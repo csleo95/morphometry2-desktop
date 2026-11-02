@@ -9,6 +9,7 @@
 import os
 import queue
 import subprocess
+import time
 from collections import deque
 import threading
 import tkinter as tk
@@ -21,10 +22,16 @@ APP_TITLE = "ENIGMA multi-phenotype morphometry"
 
 # The protocol. Every site runs these unchanged - that is what makes the
 # results poolable.
-PIPELINE_FLAGS = [
-    "--cortical-measures", "recon-all", "after2.curvs", "after2.shfd",
-                           "after2.lgi", "after2.gwc", "after2.myelin", "mind",
-    "--subcortical-measures", "subcorticalshape", "scmind", "subseg", "segpve",
+# The steps a site may, but should not, switch off. Order matches slurm.sh;
+# recon-all, subcorticalshape, subseg and segpve are not offered because the
+# rest depends on them.
+CORTICAL_STEPS = ["after2.curvs", "after2.mantle", "after2.shfd", "after2.lgi",
+                  "after2.gwc", "after2.myelin", "mind"]
+SUBCORTICAL_STEPS = ["scmind"]
+STEP_CHOICES = CORTICAL_STEPS + SUBCORTICAL_STEPS
+
+# Everything after the two measure lists; identical at every site.
+PIPELINE_FLAGS_REST = [
     "--qc-measures", "euler", "mriqc", "fsqc",
     "--after2-surface", "retess",
     "--segpve-surfaces", "native", "retess",
@@ -35,6 +42,7 @@ PIPELINE_FLAGS = [
     "--parcellate",
     "--parcellations", "HCPMMP1",
     "--parcellate-measures", "recon-all",
+    "--zip-contents", "all",
 ]
 
 HINT = "#888"
@@ -55,6 +63,8 @@ class Launcher(ttk.Frame):
         self._marked: dict[str, int] = {}         # log blocks that get rewritten
         self.lines: queue.Queue = queue.Queue()
         self.report: rt.DatasetReport | None = None
+        self._scanned_path: str | None = None     # which folder self.report is about
+        self._orphan_job = None
 
         self.runtime = rt.detect_runtime() or ""
         self.flight = rt.preflight(self.runtime or None)
@@ -74,6 +84,8 @@ class Launcher(ttk.Frame):
         # starts at what fits comfortably; the spinner goes to every core
         self.nprocs = tk.IntVar(value=max(1, min(self.flight.parallel,
                                                  self.host_cores)))
+        # all on by default: the protocol has to be the same at every site
+        self.steps = {name: tk.BooleanVar(value=True) for name in STEP_CHOICES}
 
         self._build()
         self._report_preflight()
@@ -90,7 +102,8 @@ class Launcher(ttk.Frame):
         row += 1
 
         row = self._entry(row, "Scans folder", self.input_dir,
-                          command=self._pick_scans)
+                          command=self._pick_scans,
+                          on_commit=self._scan_if_changed)
 
         ttk.Label(self, text="Folder layout").grid(row=row, column=0,
                                                    sticky="w", pady=5)
@@ -116,6 +129,17 @@ class Launcher(ttk.Frame):
         # figure already; this only keeps it in step afterwards
         self.nprocs.trace_add("write", lambda *_: self._update_estimate())
         row += 1
+
+        ttk.Label(self, text="Preprocessing steps").grid(row=row, column=0,
+                                                        sticky="nw", pady=5)
+        boxes = ttk.Frame(self)
+        boxes.grid(row=row, column=1, columnspan=2, sticky="w", pady=5)
+        per_row = 4
+        for i, name in enumerate(STEP_CHOICES):
+            ttk.Checkbutton(boxes, text=name, variable=self.steps[name]).grid(
+                row=i // per_row, column=i % per_row, sticky="w", padx=(0, 14))
+        row += 1
+        row = self._hint(row, "Please do not change this.")
 
         ttk.Separator(self).grid(row=row, column=0, columnspan=3,
                                  sticky="ew", pady=14)
@@ -156,9 +180,29 @@ class Launcher(ttk.Frame):
         total = f" of {host:.0f} GB total" if host else ""
         line = (f"{n} x {rt.GB_PER_SUBJECT:g} GB per subject = "
                 f"{want:.0f} GB{total}.")
-        if host and want > host:
-            line += f"\nThat is more RAM than this computer has."
+        if host:
+            _, cap = rt.run_plan(n, host)
+            if cap + 0.5 < want:
+                # the figure Run will actually use, so nobody is surprised later
+                fits = int(cap // rt.GB_PER_SUBJECT)
+                line += (f"\nThis computer can give the run up to {cap:.0f} GB"
+                         + (f", enough for {fits} at a time." if fits >= 1
+                            else f", less than the {rt.GB_PER_SUBJECT:g} GB "
+                                 f"one subject is estimated to need. The run "
+                                 f"will still be attempted with it."))
         return line + '\nChange "Subjects in parallel" above to use more or less.'
+
+    def _pipeline_flags(self) -> list[str]:
+        """The full protocol, with whichever steps are ticked. Main thread
+        only: it reads Tk variables."""
+        cortical = ["recon-all"] + [s for s in CORTICAL_STEPS
+                                    if self.steps[s].get()]
+        subcortical = (["subcorticalshape"]
+                       + [s for s in SUBCORTICAL_STEPS if self.steps[s].get()]
+                       + ["subseg", "segpve"])
+        return (["--cortical-measures", *cortical,
+                 "--subcortical-measures", *subcortical]
+                + PIPELINE_FLAGS_REST)
 
     def _update_estimate(self):
         """Keep the RAM figure in the Messages panel following the spinner."""
@@ -168,10 +212,15 @@ class Launcher(ttk.Frame):
             return                                # mid-typing in the spinbox
         self._replace_section("ram", self._ram_text(n))
 
-    def _entry(self, row, label, var, command=None):
+    def _entry(self, row, label, var, command=None, on_commit=None):
         ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Entry(self, textvariable=var).grid(row=row, column=1,
-                                               sticky="ew", pady=5)
+        entry = ttk.Entry(self, textvariable=var)
+        entry.grid(row=row, column=1, sticky="ew", pady=5)
+        if on_commit:
+            # a typed or pasted path is taken when the field is left or Enter
+            # is pressed, so it gets inspected like a browsed one
+            entry.bind("<FocusOut>", lambda _e: on_commit())
+            entry.bind("<Return>", lambda _e: on_commit())
         ttk.Button(self, text="Browse", width=8,
                    command=command or (lambda: self._pick_dir(var))).grid(
             row=row, column=2, sticky="w", padx=(6, 0))
@@ -206,12 +255,20 @@ class Launcher(ttk.Frame):
     def _scan(self, path: str):
         """Inspect on a worker thread: rglob over a big tree, possibly on a
         network share, must not freeze the window."""
+        self._scanned_path = path
+        self.report = None                        # stale until the report lands
         self._section("Scans folder", f"Inspecting {path}")
 
         def worker():
-            self.lines.put(("REPORT", rt.scan_dataset(Path(path))))
+            self.lines.put(("REPORT", path, rt.scan_dataset(Path(path))))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_if_changed(self):
+        """A path typed into the field is inspected too, not only a browsed one."""
+        path = self.input_dir.get().strip()
+        if path and path != self._scanned_path:
+            self._scan(path)
 
     def _apply_report(self, report: rt.DatasetReport):
         self.report = report
@@ -243,21 +300,73 @@ class Launcher(ttk.Frame):
         for w in f.warnings:
             self._section("Note", w)
 
+        # Not even one subject can have what it needs: say so at once, rather
+        # than letting a run start and die hours in.
+        if f.host_gb:
+            _, cap_one = rt.run_plan(1, f.host_gb)
+            if cap_one < rt.GB_PER_SUBJECT:
+                self._section(
+                    "Note",
+                    f"This computer can give the pipeline at most {cap_one:.0f} GB; "
+                    f"one subject is estimated to need about "
+                    f"{rt.GB_PER_SUBJECT:g} GB. Runs will still be attempted "
+                    f"with what there is, one subject at a time. If a step "
+                    f"runs out of memory the run stops and says so. That limit "
+                    f"comes from the computer's total RAM ({f.host_gb:.0f} GB), "
+                    f"not from any setting.")
+
+        # A run left going by a session that was closed without stopping it.
+        if rt.container_running(self.runtime):
+            self._section(
+                "Note",
+                "A run started earlier is still going in the background - "
+                "probably from a session that was closed without stopping it. "
+                "Press Stop to end it, or wait for it to finish; Run is not "
+                "available until then.")
+            self.stop_btn.state(["!disabled"])
+            self.run_btn.state(["disabled"])
+            self._watch_orphan()
+
+    def _watch_orphan(self):
+        """Give Run back once a background run from an earlier session ends."""
+        if rt.container_running(self.runtime):
+            self._orphan_job = self.after(15000, self._watch_orphan)
+            return
+        self._orphan_job = None
+        self.run_btn.state(["!disabled"])
+        self.stop_btn.state(["disabled"])
+        self._section("Note", "The background run has ended. Press Run to "
+                              "carry on from where it stopped.")
+
     # -------------------------------------------------------------- commands
 
     def _validate(self) -> str | None:
         if not self.flight.ok:
             return "Docker is not usable yet. See the message in the log."
-        if not self.input_dir.get():
+        path = self.input_dir.get().strip()
+        if not path:
             return "Choose the folder holding your scans."
+        if path != self._scanned_path or self.report is None:
+            # typed after the last inspection, or still being inspected: look
+            # now rather than run with another folder's counts
+            self._scanned_path = path
+            self._section("Scans folder", f"Inspecting {path}")
+            self._apply_report(rt.scan_dataset(Path(path)))
         if self.report is None or self.report.problem:
             return "No usable scans found in that folder."
+        if self.report.blocking:
+            return self.report.blocking
         if not self.output_dir.get():
             return "Choose an output folder."
         if self.external.get() and not Path(self.external.get()).is_dir():
             return "The existing recon-all folder does not exist."
-        if not 1 <= self.nprocs.get() <= self.max_cores:
-            return f"CPU cores must be between 1 and {self.max_cores}."
+        try:
+            n = int(self.nprocs.get())
+        except (tk.TclError, ValueError):
+            n = 0
+        if not 1 <= n <= self.max_cores:
+            return (f"Subjects in parallel must be a whole number between 1 "
+                    f"and {self.max_cores}.")
         return None
 
     # --------------------------------------------------------------- actions
@@ -288,52 +397,75 @@ class Launcher(ttk.Frame):
         ):
             return
 
-        # What this core count wants, and the most the computer can spare.
-        want = rt.estimate_gb(self.nprocs.get())
-        ceiling = (rt.host_safe_gb(self.flight.host_gb)
-                   if self.flight.host_gb else want)
-        target = min(want, ceiling)
+        # What this many subjects wants, and the most Docker may sanely be set
+        # to on this computer - the same arithmetic the RAM text shows.
+        n_procs = int(self.nprocs.get())
+        needed_setting, target = rt.run_plan(n_procs, self.flight.host_gb)
 
-        # Docker Desktop's memory limit lives in a file this user owns, so if
-        # it is too small for the chosen cores, raise it for the run instead of
-        # asking anyone to go and change a slider. Put it back afterwards.
-        self._restore_mem = None
-        have = self.flight.memory_gb or 0
-        needed_setting = target + 2.0            # room for the VM itself
-        current = rt.read_memory_setting()
+        # Read now, on the main thread; the worker must not touch Tk variables.
+        args = dict(
+            runtime=self.runtime,
+            input_path=Path(self.input_dir.get()),
+            input_type=self.input_type.get(),
+            output_dir=Path(self.output_dir.get()),
+            external_dir=Path(self.external.get()) if self.external.get() else None,
+            n_procs=n_procs,
+            pipeline_flags=self._pipeline_flags(),
+            # what the pipeline actually iterates over - one per session in
+            # BIDS, one per file in flat - so the whole dataset is one archive
+            subjects=self.report.units,
+        )
 
         steps = []
-        if current and have < target and needed_setting > (current[2] / 1024):
-            self._restore_mem = current[2] / 1024
+
+        # Docker's memory limit lives in a file this user owns, so raise it for
+        # the run rather than asking anyone to move a slider. Best effort only.
+        have = self.flight.memory_gb or 0
+        wsl = self.flight.wsl
+        if have < target and rt.can_start_with_gb(needed_setting):
             steps.append((
                 f"Giving Docker {needed_setting:.0f} GB for this run",
-                lambda gb=needed_setting: (rt.write_memory_setting(gb)
-                                           and rt.restart_desktop())))
+                lambda gb=needed_setting: rt.ensure_memory(gb, wsl=wsl),
+                # on WSL 2 nothing restarts: the step only says what to do
+                None if wsl else "This takes a minute while Docker restarts."))
 
-        cap = target
-        budget = target
+        start = rt.start_hint(self.flight.flavour)
+        steps.append(("Checking Docker is running",
+                      lambda: (True, "Docker is running.")
+                      if rt.ensure_running(self.runtime)
+                      else (False, "Docker is not running and could not be "
+                                   f"started. {start} Then press Run again.")))
 
         if not present:
             steps.append(("Downloading the container",
                           rt.pull_command(self.runtime)))
-        steps.append((
-            "Pipeline run",
-            rt.build_command(
-                runtime=self.runtime,
-                input_path=Path(self.input_dir.get()),
-                input_type=self.input_type.get(),
-                output_dir=Path(self.output_dir.get()),
-                external_dir=Path(self.external.get()) if self.external.get() else None,
-                n_procs=self.nprocs.get(),
-                pipeline_flags=PIPELINE_FLAGS,
-                subjects=self.report.subjects,
-                memory_cap_gb=cap,
-                scheduler_budget_gb=budget,
-            )))
+
+        # Built last, and lazily: only now is it known how much memory Docker
+        # really ended up with, which may be less than was asked for.
+        def pipeline_command():
+            flight = rt.preflight(args["runtime"])
+            usable, _, _ = rt.memory_plan(flight.memory_gb, self.host_cores,
+                                          flight.host_gb)
+            cap = min(target, usable) if usable else target
+            # The scheduler is deliberately told less than the hard cap.
+            # Observed: hypothalamic_subunits_node declares mem_gb=8.0 and was
+            # still killed by signal 9, so declared estimates undershoot real
+            # use. Leaving a margin between what the scheduler packs to and
+            # what Docker enforces gives that overshoot somewhere to go.
+            return rt.build_command(memory_cap_gb=cap,
+                                    scheduler_budget_gb=round(cap * 0.85, 1),
+                                    **args)
+
+        steps.append(("Pipeline run", pipeline_command))
         self._spawn(steps)
 
     def on_stop(self):
         if not (self.proc and self.proc.poll() is None):
+            # nothing of ours is running, but a container from an earlier
+            # session may be - stop that instead
+            self._write("\nStopping the background run.\n")
+            threading.Thread(target=lambda: rt.stop_container(self.runtime),
+                             daemon=True).start()
             return
         self.stopping = True
         self._write("\nStopping.\n")
@@ -355,23 +487,42 @@ class Launcher(ttk.Frame):
         # Read on the main thread: Tk variables must not be touched from the
         # worker, and doing so raises "main thread is not in main loop".
         out_dir = Path(self.output_dir.get())
+        n_units = self.report.units if self.report else None
+        unit_word = ("subject-sessions"
+                     if self.report and self.report.longitudinal else "subjects")
+        flavour = self.flight.flavour
+        # So crash reports written from now on can be told apart from ones
+        # left by earlier attempts.
+        started_at = time.time()
 
         def worker():
             code = 0
+            failed_step = None
             tail: deque[str] = deque(maxlen=60)
-            for label, cmd in steps:
-                # A step can be a command to run, or something to do first -
-                # such as giving Docker more memory, which is not a command.
+            for step in steps:
+                label, cmd = step[0], step[1]
+                note = step[2] if len(step) > 2 else None
+                # A step is either a command, or something to do first that
+                # produces one. Preparation steps never fail the run: if they
+                # cannot do what they wanted, the run continues with whatever
+                # the machine is actually able to give.
                 if callable(cmd):
-                    self.lines.put(("SECTION", label,
-                                    "This takes a minute while Docker "
-                                    "restarts.\n"))
-                    if cmd():
-                        self.lines.put("Done.\n")
+                    if note:
+                        # only a step that keeps the user waiting announces
+                        # itself first; a factory just yields its command
+                        self.lines.put(("SECTION", label, note + "\n"))
+                    result = cmd()
+
+                    if isinstance(result, (list, tuple)) and result and \
+                            isinstance(result[0], str):
+                        cmd = list(result)        # it built the command
+                    else:
+                        ok, text = result
+                        if note:
+                            self.lines.put(text.rstrip() + "\n")
+                        else:
+                            self.lines.put(("SECTION", label, text.rstrip() + "\n"))
                         continue
-                    self.lines.put("Could not change Docker's memory.\n")
-                    code = 1
-                    break
 
                 self.lines.put(("SECTION", label,
                                 "$ " + " ".join(str(c) for c in cmd) + "\n"))
@@ -392,20 +543,16 @@ class Launcher(ttk.Frame):
                     code = 1
 
                 if code != 0:
+                    failed_step = label
                     break
 
-            # Only borrowed for the run: put the original setting back. The
-            # file alone is enough - it applies at Docker's next restart, so
-            # nothing is disrupted now.
-            if getattr(self, "_restore_mem", None):
-                rt.write_memory_setting(self._restore_mem)
-                self.lines.put(f"\nDocker's memory setting put back to "
-                               f"{self._restore_mem:.0f} GB.\n")
-                self._restore_mem = None
-
+            # The setting is left where it is. It is bounded by what is safe
+            # for this computer, and putting it back would mean another Docker
+            # restart now and again at the start of the next run.
             if code == 0:
                 self.lines.put(("GOOD", "Finished",
-                                rt.summarise_outputs(out_dir)))
+                                rt.summarise_outputs(out_dir, n_units,
+                                                     started_at, unit_word)))
             elif self.stopping:
                 self.lines.put(("SECTION", "Stopped",
                                 "The run was stopped. Press Run again to carry "
@@ -413,7 +560,9 @@ class Launcher(ttk.Frame):
             else:
                 self.lines.put(("FAIL", "Pipeline failed",
                                 rt.diagnose_failure(self.runtime, code,
-                                                    "".join(tail))))
+                                                    "".join(tail), out_dir,
+                                                    started_at, failed_step,
+                                                    flavour)))
             self.lines.put(None)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -421,9 +570,11 @@ class Launcher(ttk.Frame):
     def on_close(self):
         """Closing the window stops the run, as the start dialog promises.
         Without this the container would keep going invisibly."""
-        if getattr(self, "_drain_job", None):
-            self.after_cancel(self._drain_job)
-            self._drain_job = None
+        for attr in ("_drain_job", "_orphan_job"):
+            job = getattr(self, attr, None)
+            if job:
+                self.after_cancel(job)
+                setattr(self, attr, None)
         if self.proc and self.proc.poll() is None:
             rt.stop_container(self.runtime, grace=3)
             try:
@@ -486,7 +637,10 @@ class Launcher(ttk.Frame):
                     continue
 
                 if isinstance(item, tuple) and item[0] == "REPORT":
-                    self._apply_report(item[1])
+                    # only the folder currently in the field, and only if Run
+                    # has not already inspected it itself in the meantime
+                    if item[1] == self._scanned_path and self.report is None:
+                        self._apply_report(item[2])
                     continue
 
                 if isinstance(item, tuple) and item[0] == "SECTION":
@@ -510,7 +664,7 @@ class Launcher(ttk.Frame):
 def main():
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.minsize(780, 700)
+    root.minsize(780, 760)
     try:
         ttk.Style().theme_use("clam")
     except tk.TclError:
